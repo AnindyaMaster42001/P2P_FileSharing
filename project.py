@@ -9,6 +9,8 @@ import hashlib
 import base64
 from datetime import datetime
 import time
+import shutil
+
 
 class User:
     def __init__(self, username, ip, port):
@@ -27,7 +29,8 @@ class P2PFileSharing:
         # User data
         self.current_user = None
         self.users = {}  # {username: User object}
-        self.groups = {}  # {group_name: [usernames]}
+        self.groups = {}  # {group_name: {'members': [usernames], 'shared_dirs': {username: [dir_paths]}}}
+        self.group_invites = {}  # {group_name: [pending_invitations]}
         self.temp_messages = []  # Temporary chat messages
         self.all_ports=[x for x in range(12345,12370)]
 
@@ -195,6 +198,26 @@ class P2PFileSharing:
                 
         return False
             
+    def handle_group_member_joined(self, message):
+        """Handle notification that a new member joined a group"""
+        group_name = message['group_name']
+        new_member = message['new_member']
+        updated_members = message['updated_members']
+        
+        # Update local group member list
+        if group_name in self.groups:
+            self.groups[group_name]['members'] = updated_members
+            
+            # Refresh UI if currently viewing this group
+            self.root.after_idle(lambda: self.add_temp_message(
+                f"{new_member} joined group {group_name}"
+            ))
+            
+            # If currently viewing group details, refresh the member list
+            if hasattr(self, 'group_members_listbox'):
+                self.root.after_idle(lambda: self.update_group_members_list(group_name))
+
+
     def server_listener(self):
         while self.is_server_running:
             try:
@@ -328,6 +351,16 @@ class P2PFileSharing:
         elif msg_type == 'file_send_request':
             # Handle file send notification
             return self.handle_file_send_request(message)
+        
+        elif msg_type == 'directory_share':
+            # Handle directory share notification
+            self.handle_directory_share(message)
+            return {'type': 'directory_ack', 'status': 'received'}
+
+        elif msg_type == 'group_member_joined':
+            # Handle new member notification
+            self.handle_group_member_joined(message)
+            return {'type': 'group_ack', 'status': 'received'}
             
         elif msg_type == 'file_send_response':
             # Handle file send response (accepted/rejected)
@@ -430,48 +463,510 @@ class P2PFileSharing:
         self.chat_entry.bind('<Return>', lambda e: self.send_chat_message())
         
         self.update_file_status()
+
+
+
+    def setup_create_group_tab(self):
+    # Group creation section
+        create_frame = ttk.LabelFrame(self.create_group_frame, text="Create New Group", padding=10)
+        create_frame.pack(fill=tk.X, pady=5)
         
+        # Group name input
+        ttk.Label(create_frame, text="Group Name:").pack(anchor=tk.W)
+        self.group_name_entry = ttk.Entry(create_frame, width=30)
+        self.group_name_entry.pack(fill=tk.X, pady=5)
+        
+        # Available peers section
+        peers_frame = ttk.LabelFrame(self.create_group_frame, text="Select Members", padding=10)
+        peers_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        ttk.Label(peers_frame, text="Available Peers:").pack(anchor=tk.W)
+        
+        # Peers listbox with checkboxes (using multiple selection)
+        self.create_peers_listbox = tk.Listbox(peers_frame, selectmode=tk.MULTIPLE, height=8)
+        self.create_peers_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(self.create_group_frame)
+        buttons_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(buttons_frame, text="Refresh Peers", 
+                command=self.refresh_create_peers).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Create Group", 
+                command=self.create_group_with_members).pack(side=tk.RIGHT, padx=5)
+        
+        # Populate peers
+        self.refresh_create_peers()
+
+    def setup_my_groups_tab(self):
+        # Groups list section
+        groups_list_frame = ttk.LabelFrame(self.my_groups_frame, text="My Groups", padding=10)
+        groups_list_frame.pack(fill=tk.X, pady=5)
+        
+        self.my_groups_listbox = tk.Listbox(groups_list_frame, height=6)
+        self.my_groups_listbox.pack(fill=tk.X, pady=5)
+        self.my_groups_listbox.bind('<<ListboxSelect>>', self.on_my_group_select)
+        
+        # Group details section
+        self.group_details_frame = ttk.LabelFrame(self.my_groups_frame, text="Group Details", padding=10)
+        self.group_details_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Initially show placeholder
+        self.show_group_placeholder()
+        
+        # Update groups list
+        self.update_my_groups_list()
+
+    def show_group_placeholder(self):
+        # Clear existing widgets
+        for widget in self.group_details_frame.winfo_children():
+            widget.destroy()
+        
+        ttk.Label(self.group_details_frame, text="Select a group to view details", 
+                font=('Arial', 10, 'italic')).pack(expand=True)
+
+    def show_group_details(self, group_name):
+        # Clear existing widgets
+        for widget in self.group_details_frame.winfo_children():
+            widget.destroy()
+        
+        # Group info
+        info_frame = ttk.Frame(self.group_details_frame)
+        info_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(info_frame, text=f"Group: {group_name}", 
+                font=('Arial', 12, 'bold')).pack(anchor=tk.W)
+        
+        # Members section
+        members_frame = ttk.LabelFrame(self.group_details_frame, text="Members", padding=10)
+        members_frame.pack(fill=tk.X, pady=5)
+
+        members_list_frame = ttk.Frame(members_frame)
+        members_list_frame.pack(fill=tk.X)
+
+        # the Listbox showing current members
+        self.group_members_listbox = tk.Listbox(members_list_frame, height=4)
+        self.group_members_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # frame for both Add and Refresh buttons
+        buttons_frame = ttk.Frame(members_list_frame)
+        buttons_frame.pack(side=tk.RIGHT, padx=5)
+
+        # "Add Member" stays as before
+        ttk.Button(buttons_frame, text="Add Member",
+                   command=lambda: self.add_member_to_group(group_name)).pack(fill=tk.X, pady=2)
+
+        # new "Refresh Members" button
+        ttk.Button(buttons_frame, text="Refresh Members",
+                   command=lambda: self.update_group_members_list(group_name)).pack(fill=tk.X, pady=2)
+
+        # populate the list initially (so new joiners show up on first view)
+        self.update_group_members_list(group_name)
+        
+        # File operations section
+        files_frame = ttk.LabelFrame(self.group_details_frame, text="File Operations", padding=10)
+        files_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Create notebook for file operations
+        files_notebook = ttk.Notebook(files_frame)
+        files_notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Shared with me tab
+        shared_with_me_frame = ttk.Frame(files_notebook)
+        files_notebook.add(shared_with_me_frame, text="Shared with Me")
+        
+        # Share directory tab
+        share_dir_frame = ttk.Frame(files_notebook)
+        files_notebook.add(share_dir_frame, text="Share Directory")
+        
+        # Setup shared with me tab
+        self.setup_shared_with_me_tab(shared_with_me_frame, group_name)
+        
+        # Setup share directory tab
+        self.setup_share_directory_tab(share_dir_frame, group_name)
+
+    def setup_shared_with_me_tab(self, parent, group_name):
+        # Shared directories list
+        ttk.Label(parent, text="Directories shared with you:").pack(anchor=tk.W, pady=5)
+        
+        # Create treeview for directories and files
+        self.shared_dirs_tree = ttk.Treeview(parent, columns=('Size', 'Sharer'), show='tree headings')
+        self.shared_dirs_tree.heading('#0', text='Name')
+        self.shared_dirs_tree.heading('Size', text='Size')
+        self.shared_dirs_tree.heading('Sharer', text='Shared By')
+        self.shared_dirs_tree.column('#0', width=200)
+        self.shared_dirs_tree.column('Size', width=80)
+        self.shared_dirs_tree.column('Sharer', width=100)
+        
+        self.shared_dirs_tree.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Download button
+        download_frame = ttk.Frame(parent)
+        download_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(download_frame, text="Download Selected", 
+                command=lambda: self.download_from_group_new(group_name)).pack(side=tk.RIGHT)
+        
+        # Populate shared directories
+        self.update_shared_directories(group_name)
+
+    def setup_share_directory_tab(self, parent, group_name):
+        # Directory selection
+        dir_frame = ttk.Frame(parent)
+        dir_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(dir_frame, text="Select directory to share:").pack(anchor=tk.W)
+        
+        self.share_dir_entry = ttk.Entry(dir_frame)
+        self.share_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        ttk.Button(dir_frame, text="Browse", 
+                command=self.browse_directory_to_share).pack(side=tk.RIGHT)
+        
+        # Members to share with
+        members_frame = ttk.LabelFrame(parent, text="Share with members:", padding=10)
+        members_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.share_members_listbox = tk.Listbox(members_frame, selectmode=tk.MULTIPLE)
+        self.share_members_listbox.pack(fill=tk.BOTH, expand=True)
+        
+        # Share button
+        share_frame = ttk.Frame(parent)
+        share_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(share_frame, text="Share Directory", 
+                command=lambda: self.share_directory_to_group(group_name)).pack(side=tk.RIGHT)
+        
+        # Populate members for sharing
+        self.update_share_members_list(group_name)
+
+    def refresh_create_peers(self):
+        self.create_peers_listbox.delete(0, tk.END)
+        for username in self.users:
+            if username != self.current_user.username:
+                self.create_peers_listbox.insert(tk.END, username)
+
+    def create_group_with_members(self):
+        group_name = self.group_name_entry.get().strip()
+        if not group_name:
+            messagebox.showwarning("Warning", "Please enter a group name")
+            return
+        
+        # Check if group name already exists
+        if group_name in self.groups:
+            messagebox.showerror("Error", "Group name already exists. Please choose a different name.")
+            return
+        
+        # Get selected members
+        selected_indices = self.create_peers_listbox.curselection()
+        selected_members = [self.create_peers_listbox.get(i) for i in selected_indices]
+        
+        if not selected_members:
+            messagebox.showwarning("Warning", "Please select at least one member")
+            return
+        
+        # Create group
+        self.groups[group_name] = {
+            'members': [self.current_user.username] + selected_members,
+            'shared_dirs': {}
+        }
+        
+        # Send group invitations to selected members
+        self.send_group_invitations(group_name, selected_members)
+        
+        # Clear form
+        self.group_name_entry.delete(0, tk.END)
+        self.create_peers_listbox.selection_clear(0, tk.END)
+        
+        # Update my groups list
+        self.update_my_groups_list()
+        
+        # Switch to My Groups tab
+        self.group_notebook.select(self.my_groups_frame)
+        
+        messagebox.showinfo("Success", f"Group '{group_name}' created successfully!")
+
+    def send_group_invitations(self, group_name, members):
+        """Send group invitations to selected members"""
+        # Get current member list to include in invitation
+        current_members = self.groups[group_name]['members'].copy()
+        
+        for member in members:
+            if member in self.users:
+                try:
+                    peer = self.users[member]
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(10)
+                    sock.connect((peer.ip, peer.port))
+                    
+                    invitation = {
+                        'type': 'group_invite',
+                        'group_name': group_name,
+                        'inviter': self.current_user.username,
+                        'members': current_members,  # Include full member list
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    sock.send(json.dumps(invitation).encode())
+                    sock.close()
+                    
+                except Exception as e:
+                    print(f"Error sending invitation to {member}: {e}")
+
+
+    def on_group_tab_changed(self, event):
+        """Handle tab change events"""
+        selected_tab = self.group_notebook.select()
+        tab_text = self.group_notebook.tab(selected_tab, "text")
+        
+        if tab_text == "My Groups":
+            self.update_my_groups_list()
+
+    def on_my_group_select(self, event):
+        selection = self.my_groups_listbox.curselection()
+        if selection:
+            group_name = self.my_groups_listbox.get(selection[0])
+            self.show_group_details(group_name)
+
+    def update_my_groups_list(self):
+        if hasattr(self, 'my_groups_listbox'):
+            self.my_groups_listbox.delete(0, tk.END)
+            for group_name in self.groups:
+                # Only show groups where current user is a member
+                if self.current_user.username in self.groups[group_name]['members']:
+                    self.my_groups_listbox.insert(tk.END, group_name)
+
+    def update_group_members_list(self, group_name):
+        if hasattr(self, 'group_members_listbox') and group_name in self.groups:
+            self.group_members_listbox.delete(0, tk.END)
+            for member in self.groups[group_name]['members']:
+                self.group_members_listbox.insert(tk.END, member)
+
+    def add_member_to_group(self, group_name):
+        # Get available peers (not already in group)
+        current_members = self.groups[group_name]['members']
+        available_peers = [user for user in self.users if user not in current_members and user != self.current_user.username]
+        
+        if not available_peers:
+            messagebox.showinfo("Info", "No available peers to add")
+            return
+        
+        # Create selection dialog
+        selection_window = tk.Toplevel(self.root)
+        selection_window.title("Add Member to Group")
+        selection_window.geometry("300x400")
+        selection_window.transient(self.root)
+        selection_window.grab_set()
+        
+        ttk.Label(selection_window, text="Select member to add:").pack(pady=10)
+        
+        # Listbox for member selection
+        member_listbox = tk.Listbox(selection_window, selectmode=tk.SINGLE)
+        member_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        for peer in available_peers:
+            member_listbox.insert(tk.END, peer)
+        
+        # Buttons
+        button_frame = ttk.Frame(selection_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        def add_selected_member():
+            selection = member_listbox.curselection()
+            if selection:
+                selected_member = member_listbox.get(selection[0])
+                # Add to group
+                self.groups[group_name]['members'].append(selected_member)
+                # Send invitation
+                self.send_group_invitations(group_name, [selected_member])
+                # Update display
+                self.update_group_members_list(group_name)
+                self.update_share_members_list(group_name)
+                selection_window.destroy()
+                messagebox.showinfo("Success", f"Added {selected_member} to group {group_name}")
+            else:
+                messagebox.showwarning("Warning", "Please select a member")
+        
+        ttk.Button(button_frame, text="Add", command=add_selected_member).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=selection_window.destroy).pack(side=tk.RIGHT)
+
+    def update_share_members_list(self, group_name):
+        if hasattr(self, 'share_members_listbox') and group_name in self.groups:
+            self.share_members_listbox.delete(0, tk.END)
+            for member in self.groups[group_name]['members']:
+                if member != self.current_user.username:
+                    self.share_members_listbox.insert(tk.END, member)
+
+    def browse_directory_to_share(self):
+        directory = filedialog.askdirectory()
+        if directory:
+            self.share_dir_entry.delete(0, tk.END)
+            self.share_dir_entry.insert(0, directory)
+
+    def share_directory_to_group(self, group_name):
+        directory = self.share_dir_entry.get().strip()
+        if not directory or not os.path.exists(directory):
+            messagebox.showwarning("Warning", "Please select a valid directory")
+            return
+        
+        # Get selected members
+        selected_indices = self.share_members_listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning("Warning", "Please select at least one member to share with")
+            return
+        
+        selected_members = [self.share_members_listbox.get(i) for i in selected_indices]
+        
+        # Add to group's shared directories
+        if self.current_user.username not in self.groups[group_name]['shared_dirs']:
+            self.groups[group_name]['shared_dirs'][self.current_user.username] = []
+        
+        # Check if directory already shared
+        if directory not in self.groups[group_name]['shared_dirs'][self.current_user.username]:
+            self.groups[group_name]['shared_dirs'][self.current_user.username].append(directory)
+        
+        # Send share notifications to selected members
+        self.send_directory_share_notifications(group_name, directory, selected_members)
+        
+        # Clear form
+        self.share_dir_entry.delete(0, tk.END)
+        self.share_members_listbox.selection_clear(0, tk.END)
+        
+        messagebox.showinfo("Success", f"Directory shared with selected members of {group_name}")
+
+    def send_directory_share_notifications(self, group_name, directory, members):
+        """Send directory share notifications to group members"""
+        for member in members:
+            if member in self.users:
+                try:
+                    peer = self.users[member]
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(10)
+                    sock.connect((peer.ip, peer.port))
+                    
+                    notification = {
+                        'type': 'directory_share',
+                        'group_name': group_name,
+                        'directory': directory,
+                        'sharer': self.current_user.username,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    sock.send(json.dumps(notification).encode())
+                    sock.close()
+                    
+                except Exception as e:
+                    print(f"Error sending directory share notification to {member}: {e}")
+
+    def update_shared_directories(self, group_name):
+        if hasattr(self, 'shared_dirs_tree') and group_name in self.groups:
+            # Clear existing items
+            for item in self.shared_dirs_tree.get_children():
+                self.shared_dirs_tree.delete(item)
+            
+            # Add shared directories
+            shared_dirs = self.groups[group_name]['shared_dirs']
+            for sharer, directories in shared_dirs.items():
+                if sharer != self.current_user.username:  # Don't show own shared directories
+                    for directory in directories:
+                        if os.path.exists(directory):
+                            # Add directory node
+                            dir_node = self.shared_dirs_tree.insert('', 'end', text=os.path.basename(directory), 
+                                                                values=('Directory', sharer), tags=('directory',))
+                            
+                            # Add files in directory
+                            try:
+                                for file_name in os.listdir(directory):
+                                    file_path = os.path.join(directory, file_name)
+                                    if os.path.isfile(file_path):
+                                        file_size = self.format_file_size(os.path.getsize(file_path))
+                                        self.shared_dirs_tree.insert(dir_node, 'end', text=file_name, 
+                                                                    values=(file_size, sharer), tags=('file',))
+                            except PermissionError:
+                                self.shared_dirs_tree.insert(dir_node, 'end', text="Permission Denied", 
+                                                            values=('', sharer), tags=('error',))
+
+    def download_from_group_new(self, group_name):
+        selection = self.shared_dirs_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a file to download")
+            return
+        
+        item = selection[0]
+        item_tags = self.shared_dirs_tree.item(item, 'tags')
+        
+        if 'file' not in item_tags:
+            messagebox.showwarning("Warning", "Please select a file (not a directory)")
+            return
+        
+        file_name = self.shared_dirs_tree.item(item, 'text')
+        sharer = self.shared_dirs_tree.item(item, 'values')[1]
+        
+        # Get the directory path
+        parent_item = self.shared_dirs_tree.parent(item)
+        dir_name = self.shared_dirs_tree.item(parent_item, 'text')
+        
+        # Find the full path
+        shared_dirs = self.groups[group_name]['shared_dirs']
+        if sharer in shared_dirs:
+            for directory in shared_dirs[sharer]:
+                if os.path.basename(directory) == dir_name:
+                    file_path = os.path.join(directory, file_name)
+                    if os.path.exists(file_path):
+                        # Copy file to downloads
+                        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads", "P2P_Group_Files")
+                        os.makedirs(downloads_dir, exist_ok=True)
+                        
+                        import shutil
+                        dest_path = os.path.join(downloads_dir, file_name)
+                        
+                        # Handle filename conflicts
+                        counter = 1
+                        base_name, ext = os.path.splitext(file_name)
+                        while os.path.exists(dest_path):
+                            dest_path = os.path.join(downloads_dir, f"{base_name}_{counter}{ext}")
+                            counter += 1
+                        
+                        try:
+                            shutil.copy2(file_path, dest_path)
+                            messagebox.showinfo("Success", f"File downloaded to: {dest_path}")
+                        except Exception as e:
+                            messagebox.showerror("Error", f"Failed to download file: {str(e)}")
+                        return
+        
+        messagebox.showerror("Error", "File not found or access denied")
+
+
+
+
     def show_group_mode(self):
         self.clear_right_panel()
         self.current_mode = "group"
         
-        # Group mode UI
-        group_frame = ttk.LabelFrame(self.right_panel, text="Group File Sharing", padding=10)
-        group_frame.pack(fill=tk.BOTH, expand=True)
+        # Main group container
+        main_group_frame = ttk.Frame(self.right_panel)
+        main_group_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Group management
-        group_mgmt_frame = ttk.LabelFrame(group_frame, text="Group Management", padding=10)
-        group_mgmt_frame.pack(fill=tk.X, pady=5)
+        # Create notebook for tabs
+        self.group_notebook = ttk.Notebook(main_group_frame)
+        self.group_notebook.pack(fill=tk.BOTH, expand=True)
         
-        group_buttons_frame = ttk.Frame(group_mgmt_frame)
-        group_buttons_frame.pack(fill=tk.X)
+        # Create Group Tab
+        self.create_group_frame = ttk.Frame(self.group_notebook)
+        self.group_notebook.add(self.create_group_frame, text="Create Group")
         
-        ttk.Button(group_buttons_frame, text="Create Group", 
-                  command=self.create_group).pack(side=tk.LEFT, padx=5)
-        ttk.Button(group_buttons_frame, text="Join Group", 
-                  command=self.join_group).pack(side=tk.LEFT, padx=5)
+        # My Groups Tab
+        self.my_groups_frame = ttk.Frame(self.group_notebook)
+        self.group_notebook.add(self.my_groups_frame, text="My Groups")
         
-        # Groups list
-        ttk.Label(group_frame, text="My Groups:").pack(anchor=tk.W, pady=(10, 0))
-        self.groups_listbox = tk.Listbox(group_frame, height=4)
-        self.groups_listbox.pack(fill=tk.X, pady=5)
-        self.groups_listbox.bind('<<ListboxSelect>>', self.on_group_select)
+        # Setup Create Group tab
+        self.setup_create_group_tab()
         
-        # Group shared directories
-        ttk.Label(group_frame, text="Group Shared Directories:").pack(anchor=tk.W, pady=(10, 0))
-        self.group_shared_dirs_listbox = tk.Listbox(group_frame, height=4)
-        self.group_shared_dirs_listbox.pack(fill=tk.X, pady=5)
+        # Setup My Groups tab
+        self.setup_my_groups_tab()
         
-        # File operations for groups
-        group_file_frame = ttk.Frame(group_frame)
-        group_file_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Button(group_file_frame, text="Share to Group", 
-                  command=self.share_to_group).pack(side=tk.LEFT, padx=5)
-        ttk.Button(group_file_frame, text="Download from Group", 
-                  command=self.download_from_group).pack(side=tk.LEFT, padx=5)
-        
-        self.update_groups_list()
+        # Bind tab change event
+        self.group_notebook.bind("<<NotebookTabChanged>>", self.on_group_tab_changed)
         
     def send_file(self):
         if not self.selected_peer:
@@ -886,9 +1381,110 @@ class P2PFileSharing:
         self.add_temp_message(f"{sender}: {msg_text}")
         
     def handle_group_invite(self, message):
-        # Handle group invitation - placeholder for now
-        pass
+        group_name = message['group_name']
+        inviter = message['inviter']
+
+        # Store the invitation data for later use
+        self._last_group_invitation = message
+
+        # Show invitation dialog
+        self.root.after_idle(self.show_group_invitation, group_name, inviter)
+
+
+    def notify_group_members_new_joiner(self, group_name, inviter):
+        """Notify existing group members that someone new has joined"""
+        if group_name not in self.groups:
+            return
         
+        # Send notification to all members except the inviter and yourself
+        for member in self.groups[group_name]['members']:
+            if member != self.current_user.username and member != inviter and member in self.users:
+                try:
+                    peer = self.users[member]
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(10)
+                    sock.connect((peer.ip, peer.port))
+                    
+                    notification = {
+                        'type': 'group_member_joined',
+                        'group_name': group_name,
+                        'new_member': self.current_user.username,
+                        'updated_members': self.groups[group_name]['members'],
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    sock.send(json.dumps(notification).encode())
+                    sock.close()
+                    
+                except Exception as e:
+                    print(f"Error notifying {member} about new group member: {e}")
+
+
+    def show_group_invitation(self, group_name, inviter):
+        result = messagebox.askyesno(
+            "Group Invitation",
+            f"{inviter} has invited you to join the group '{group_name}'\n\n"
+            f"Do you want to accept this invitation?",
+            icon='question'
+        )
+        if not result:
+            messagebox.showinfo("Info", f"Group invitation from {inviter} declined")
+            return
+
+        # Get the invitation details from the most recent invite
+        invitation_data = None
+        if hasattr(self, '_last_group_invitation'):
+            invitation_data = self._last_group_invitation
+        
+        # Create or update the group with full member list
+        if group_name not in self.groups:
+            self.groups[group_name] = {'members': [], 'shared_dirs': {}}
+        
+        # If we have invitation data with member list, use it
+        if invitation_data and 'members' in invitation_data:
+            # Use the complete member list from invitation
+            self.groups[group_name]['members'] = invitation_data['members'].copy()
+            # Add yourself if not already in the list
+            if self.current_user.username not in self.groups[group_name]['members']:
+                self.groups[group_name]['members'].append(self.current_user.username)
+        else:
+            # Fallback: just add inviter and yourself
+            members = self.groups[group_name]['members']
+            if inviter not in members:
+                members.append(inviter)
+            if self.current_user.username not in members:
+                members.append(self.current_user.username)
+        
+        # Notify existing group members about the new joiner
+        self.notify_group_members_new_joiner(group_name, inviter)
+        
+        # Refresh UI
+        self.update_my_groups_list()
+        messagebox.showinfo("Success", f"You have joined the group '{group_name}'")
+
+
+        
+
+    def handle_directory_share(self, message):
+        group_name = message['group_name']
+        directory = message['directory']
+        sharer = message['sharer']
+        
+        # Update group's shared directories
+        if group_name in self.groups:
+            if sharer not in self.groups[group_name]['shared_dirs']:
+                self.groups[group_name]['shared_dirs'][sharer] = []
+            
+            if directory not in self.groups[group_name]['shared_dirs'][sharer]:
+                self.groups[group_name]['shared_dirs'][sharer].append(directory)
+        
+         # Show notification and refresh the Shared-with-Me view
+        self.root.after_idle(lambda: self.add_temp_message(
+            f"{sharer} shared a directory with group {group_name}"
+        ))
+        self.root.after_idle(lambda: self.update_shared_directories(group_name))
+
+
     def add_temp_message(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         full_message = f"[{timestamp}] {message}"
@@ -906,44 +1502,44 @@ class P2PFileSharing:
             self.chat_display.config(state=tk.DISABLED)
             self.chat_display.see(tk.END)
             
-    def create_group(self):
-        group_name = tk.simpledialog.askstring("Create Group", "Enter group name:")
-        if group_name:
-            self.groups[group_name] = [self.current_user.username]
-            self.update_groups_list()
-            messagebox.showinfo("Success", f"Group '{group_name}' created")
+    # def create_group(self):
+    #     group_name = tk.simpledialog.askstring("Create Group", "Enter group name:")
+    #     if group_name:
+    #         self.groups[group_name] = [self.current_user.username]
+    #         self.update_groups_list()
+    #         messagebox.showinfo("Success", f"Group '{group_name}' created")
             
-    def join_group(self):
-        # Simplified group joining - in real implementation, this would involve
-        # network communication to find and join existing groups
-        group_name = tk.simpledialog.askstring("Join Group", "Enter group name:")
-        if group_name:
-            if group_name not in self.groups:
-                self.groups[group_name] = []
-            if self.current_user.username not in self.groups[group_name]:
-                self.groups[group_name].append(self.current_user.username)
-                self.update_groups_list()
-                messagebox.showinfo("Success", f"Joined group '{group_name}'")
-            else:
-                messagebox.showinfo("Info", "Already in this group")
+    # def join_group(self):
+    #     # Simplified group joining - in real implementation, this would involve
+    #     # network communication to find and join existing groups
+    #     group_name = tk.simpledialog.askstring("Join Group", "Enter group name:")
+    #     if group_name:
+    #         if group_name not in self.groups:
+    #             self.groups[group_name] = []
+    #         if self.current_user.username not in self.groups[group_name]:
+    #             self.groups[group_name].append(self.current_user.username)
+    #             self.update_groups_list()
+    #             messagebox.showinfo("Success", f"Joined group '{group_name}'")
+    #         else:
+    #             messagebox.showinfo("Info", "Already in this group")
                 
-    def share_to_group(self):
-        if not self.selected_group:
-            messagebox.showwarning("Warning", "Please select a group first")
-            return
+    # def share_to_group(self):
+    #     if not self.selected_group:
+    #         messagebox.showwarning("Warning", "Please select a group first")
+    #         return
             
-        directory = filedialog.askdirectory()
-        if directory:
-            # In a real implementation, this would sync the directory with group members
-            messagebox.showinfo("Success", f"Directory shared to group '{self.selected_group}'")
+    #     directory = filedialog.askdirectory()
+    #     if directory:
+    #         # In a real implementation, this would sync the directory with group members
+    #         messagebox.showinfo("Success", f"Directory shared to group '{self.selected_group}'")
             
-    def download_from_group(self):
-        if not self.selected_group:
-            messagebox.showwarning("Warning", "Please select a group first")
-            return
+    # def download_from_group(self):
+    #     if not self.selected_group:
+    #         messagebox.showwarning("Warning", "Please select a group first")
+    #         return
             
-        # In a real implementation, this would show files available from group members
-        messagebox.showinfo("Info", "Group file download feature - to be implemented")
+    #     # In a real implementation, this would show files available from group members
+    #     messagebox.showinfo("Info", "Group file download feature - to be implemented")
         
     def on_user_select(self, event):
         selection = self.users_listbox.curselection()
@@ -964,10 +1560,8 @@ class P2PFileSharing:
                     self.users_listbox.insert(tk.END, username)
                     
     def update_groups_list(self):
-        if hasattr(self, 'groups_listbox'):
-            self.groups_listbox.delete(0, tk.END)
-            for group_name in self.groups:
-                self.groups_listbox.insert(tk.END, group_name)
+        # This method is now handled by update_my_groups_list
+        pass
                 
     def clear_main_frame(self):
         for widget in self.main_frame.winfo_children():
