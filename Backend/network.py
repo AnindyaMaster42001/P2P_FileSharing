@@ -1,0 +1,209 @@
+import socket
+import threading
+import json
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class NetworkManager:
+    def __init__(self, app_controller):
+        self.app_controller = app_controller
+        self.server_socket = None
+        self.is_server_running = False
+        self.all_ports = list(range(12345, 12370))
+        
+    def discover_used_ports(self):
+        """Discover which ports are already in use using threading"""
+        used_ports = set()
+        
+        def check_port(port):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.2)
+                result = sock.connect_ex(('127.0.0.1', port))
+                if result == 0:
+                    used_ports.add(port)
+                sock.close()
+            except:
+                pass
+        
+        # Use threading to check ports concurrently
+        threads = []
+        for port in self.all_ports:
+            thread = threading.Thread(target=check_port, args=(port,))
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all threads to complete with a reasonable timeout
+        for thread in threads:
+            thread.join(timeout=0.5)
+        
+        return used_ports
+        
+    def start_server(self, requested_port):
+        """Start the server on an available port"""
+        max_attempts = 10
+        current_port = requested_port
+        
+        # Get used ports concurrently
+        used_ports = self.discover_used_ports()
+        
+        for attempt in range(max_attempts):
+            # Skip ports that are already in use
+            if current_port in used_ports:
+                current_port += 1
+                continue
+                
+            try:
+                self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.server_socket.bind(('127.0.0.1', current_port))
+                self.server_socket.listen(5)
+                self.is_server_running = True
+                
+                # Start server thread
+                server_thread = threading.Thread(target=self.server_listener, daemon=True)
+                server_thread.start()
+                
+                logger.info(f"Server started on port {current_port}")
+                return current_port
+                
+            except Exception as e:
+                logger.error(f"Server start error on port {current_port}: {e}")
+                if self.server_socket:
+                    self.server_socket.close()
+                current_port += 1
+                
+        return None
+    
+    def server_listener(self):
+        """Listen for incoming connections"""
+        while self.is_server_running:
+            try:
+                client_socket, address = self.server_socket.accept()
+                client_thread = threading.Thread(
+                    target=self.handle_client, 
+                    args=(client_socket, address),
+                    daemon=True
+                )
+                client_thread.start()
+            except Exception as e:
+                if self.is_server_running:
+                    logger.error(f"Server error: {e}")
+    
+    def handle_client(self, client_socket, address):
+        """Handle client connection and process messages"""
+        try:
+            client_socket.settimeout(30)
+            data = client_socket.recv(8192)
+            
+            if not data:
+                return
+            
+            try:
+                message = json.loads(data.decode())
+                msg_type = message.get('type')
+                
+                if msg_type == 'file_transfer_start':
+                    response = self.app_controller.handle_file_transfer_start(message)
+                    client_socket.send(json.dumps(response).encode())
+                    
+                    if response.get('status') == 'ready':
+                        self.app_controller.receive_file_chunks(client_socket)
+                else:
+                    response = self.app_controller.process_message(message)
+                    if response:
+                        client_socket.send(json.dumps(response).encode())
+                        
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+            except Exception as e:
+                logger.error(f"Message processing error: {e}")
+                
+        except socket.timeout:
+            logger.warning("Client socket timeout")
+        except Exception as e:
+            logger.error(f"Client handling error: {e}")
+        finally:
+            try:
+                client_socket.close()
+            except:
+                pass
+    
+    def discover_peers(self, current_user):
+        """Discover peers on the network"""
+        discovered_peers = []
+        
+        def scan_port(ip, port):
+            if port == current_user.port:
+                return
+                
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex((ip, port))
+                if result == 0:
+                    message = {
+                        'type': 'discover', 
+                        'username': current_user.username,
+                        'port': current_user.port,
+                        'ip': current_user.ip
+                    }
+                    sock.send(json.dumps(message).encode())
+                    
+                    sock.settimeout(5)
+                    response = sock.recv(1024)
+                    if response:
+                        peer_info = json.loads(response.decode())
+                        if peer_info.get('username') != current_user.username:
+                            discovered_peers.append(peer_info)
+                        
+                sock.close()
+            except Exception as e:
+                logger.debug(f"Discovery error for port {port}: {e}")
+                
+        # Scan local network
+        base_ip = "127.0.0.1"
+        
+        threads = []
+        for port in self.all_ports:
+            t = threading.Thread(target=scan_port, args=(base_ip, port))
+            threads.append(t)
+            t.start()
+                
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
+            
+        return discovered_peers
+    
+    def send_message(self, peer, message_data):
+        """Send a message to a peer"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((peer.ip, peer.port))
+            
+            sock.send(json.dumps(message_data).encode())
+            
+            # Wait for response
+            response = sock.recv(1024)
+            sock.close()
+            
+            if response:
+                return json.loads(response.decode())
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error sending message to {peer.username}: {e}")
+            return None
+            
+    def shutdown(self):
+        """Shutdown the server"""
+        self.is_server_running = False
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass

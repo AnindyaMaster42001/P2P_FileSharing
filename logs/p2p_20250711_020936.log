@@ -1,0 +1,19 @@
+2025-07-11 02:09:36,747 - p2p_file_sharing - INFO - Starting P2P File Sharing Application
+2025-07-11 02:09:36,940 - p2p_file_sharing - ERROR - Unhandled exception: 'MainWindow' object has no attribute 'show_login'
+2025-07-11 02:09:36,940 - p2p_file_sharing - ERROR - Unhandled exception: 'MainWindow' object has no attribute 'show_login'
+2025-07-11 02:09:36,948 - p2p_file_sharing - ERROR - Traceback (most recent call last):
+  File "D:\Networking_Project\Version1\P2P_FileSharing\main.py", line 25, in main
+    main_window = MainWindow(app_controller)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Networking_Project\Version1\P2P_FileSharing\Frontend\main_window.py", line 37, in __init__
+    self.show_login
+AttributeError: 'MainWindow' object has no attribute 'show_login'
+
+2025-07-11 02:09:36,948 - p2p_file_sharing - ERROR - Traceback (most recent call last):
+  File "D:\Networking_Project\Version1\P2P_FileSharing\main.py", line 25, in main
+    main_window = MainWindow(app_controller)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Networking_Project\Version1\P2P_FileSharing\Frontend\main_window.py", line 37, in __init__
+    self.show_login
+AttributeError: 'MainWindow' object has no attribute 'show_login'
+
