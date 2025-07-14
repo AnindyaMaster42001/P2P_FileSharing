@@ -175,7 +175,7 @@ class NetworkManager:
         try:
             client_socket.settimeout(30)
             data = client_socket.recv(8192)
-            
+            logger.info(f"Received discovery request from {message.get('username')} at {message.get('ip')}:{message.get('port')}")
             if not data:
                 return
             
@@ -213,13 +213,14 @@ class NetworkManager:
         """Discover peers on the network"""
         discovered_peers = []
         
-        def scan_port(ip, port):
+        def scan_target(ip, port):
+            # Skip scanning our own IP:port
             if ip == self.local_ip and port == current_user.port:
-                return  # Skip our own IP:port
-                
+                return
+            logger.info(f"Starting peer discovery from {self.local_ip} (User: {current_user.username}, Port: {current_user.port})")
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
+                sock.settimeout(30)  # Shorter timeout for network scanning
                 result = sock.connect_ex((ip, port))
                 if result == 0:
                     message = {
@@ -230,7 +231,7 @@ class NetworkManager:
                     }
                     sock.send(json.dumps(message).encode())
                     
-                    sock.settimeout(5)
+                    sock.settimeout(2)
                     response = sock.recv(1024)
                     if response:
                         peer_info = json.loads(response.decode())
@@ -241,18 +242,60 @@ class NetworkManager:
             except Exception as e:
                 logger.debug(f"Discovery error for {ip}:{port}: {e}")
         
-        # Scan local network with thread pool
+        # Get the subnet base from local IP dynamically
+        ip_parts = self.local_ip.split('.')
+        subnet_base = '.'.join(ip_parts[0:3]) + '.'
+        
+        # Store our own last octet for comparison
+        our_last_octet = int(ip_parts[3])
+        
+        # Create threads list
         threads = []
-        # Scan the same IP (our machine) on different ports
+        
+        # 1. Scan localhost on all ports (existing functionality)
         for port in self.all_ports:
-            t = threading.Thread(target=scan_port, args=(self.local_ip, port))
+            t = threading.Thread(target=scan_target, args=(self.local_ip, port))
             threads.append(t)
             t.start()
-            
-        # Wait for all threads to complete
+        
+        # 2. Scan network devices - optimized for your subnet
+        # Focus on the most common IP ranges first
+        
+        # Scan common device IPs first (1-20, where routers and servers often are)
+        for last_octet in range(1, 21):
+            # Skip our own IP as we already scanned all ports on it
+            if last_octet == our_last_octet:
+                continue
+                
+            target_ip = subnet_base + str(last_octet)
+            # For these important IPs, scan a few ports
+            for port in self.all_ports[:3]:  # First 3 ports in your range
+                t = threading.Thread(target=scan_target, args=(target_ip, port))
+                threads.append(t)
+                t.start()
+        
+        # Then scan the rest of the subnet with fewer ports per IP
+        # This is where most client devices would be
+        for last_octet in range(21, 255):
+            # Skip our own IP
+            if last_octet == our_last_octet:
+                continue
+                
+            target_ip = subnet_base + str(last_octet)
+            # For regular IPs, just scan the first port in our range to reduce traffic
+            port = self.all_ports[0]  # Just the first port
+            t = threading.Thread(target=scan_target, args=(target_ip, port))
+            threads.append(t)
+            t.start()
+        
+        # Set a maximum wait time for all threads (45 seconds total for a full subnet scan)
+        start_time = time.time()
         for t in threads:
-            t.join()
+            # Don't wait more than remaining time
+            remaining_time = max(45 - (time.time() - start_time), 0.1)
+            t.join(timeout=remaining_time)
             
+        logger.info(f"Discovered {len(discovered_peers)} peers on the network")
         return discovered_peers
     
     def send_message(self, peer, message_data, timeout=5):
