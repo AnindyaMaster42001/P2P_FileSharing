@@ -12,12 +12,19 @@ class NetworkManager:
         self.app_controller = app_controller
         self.server_socket = None
         self.is_server_running = False
+        self.discovery_socket = None
+        self.discovery_listener_running = False
         self.all_ports = list(range(12345, 12370))
         
         # Get and store local IP
         self.local_ip = self.get_local_ip()
         logger.info(f"Using local network IP: {self.local_ip}")
-    
+        
+        # Initialize known peers
+        self.known_peers = {}
+        self.discovered_peers_cache = []
+        self.discovery_lock = threading.Lock()
+        
     def get_local_ip(self):
         """Get the local IP address of this machine on the network"""
         try:
@@ -47,8 +54,7 @@ class NetworkManager:
                 logger.error(f"Error getting hostname IP: {e}")
                 # If all else fails, default to localhost
                 return "127.0.0.1"
-       
-       
+    
     def check_peer_availability(self, peer):
         """Check if a peer is available"""
         try:
@@ -66,6 +72,34 @@ class NetworkManager:
         except Exception as e:
             logger.error(f"Error checking peer availability: {e}")
             return False 
+        
+    def test_bidirectional_connectivity(self, peer, current_user):
+        """Test if both devices can connect to each other"""
+        # Test outgoing connection
+        can_connect_out = self.check_peer_availability(peer)
+        
+        # Request peer to test connection back to us
+        if can_connect_out:
+            try:
+                test_message = {
+                    'type': 'connectivity_test',
+                    'test_ip': self.local_ip,
+                    'test_port': current_user.port
+                }
+                response = self.send_message(peer, test_message, timeout=5)
+                can_connect_in = response and response.get('status') == 'connected'
+                
+                logger.info(f"Connectivity test with {peer.username}: "
+                        f"Outgoing={'OK' if can_connect_out else 'FAIL'}, "
+                        f"Incoming={'OK' if can_connect_in else 'FAIL'}")
+                
+                return can_connect_out, can_connect_in
+            except Exception as e:
+                logger.error(f"Connectivity test failed: {e}")
+                return can_connect_out, False
+        
+        return False, False
+        
     def discover_used_ports(self):
         """Discover which ports are already in use using threading"""
         used_ports = set()
@@ -175,7 +209,6 @@ class NetworkManager:
         try:
             client_socket.settimeout(30)
             data = client_socket.recv(8192)
-            
             if not data:
                 return
             
@@ -209,76 +242,377 @@ class NetworkManager:
             except:
                 pass
     
-    def discover_peers(self, current_user):
-        """Discover peers on the network"""
-        discovered_peers = []
+    def start_discovery_listener(self, current_user):
+        """Start a persistent discovery listener on a dedicated port"""
+        if self.discovery_listener_running:
+            logger.info("Discovery listener already running")
+            return
+            
+        discovery_port = current_user.port + 100  # Use a different port for discovery
         
-        def scan_port(ip, port):
+        def discovery_listener_thread():
+            max_retries = 5
+            retry_count = 0
+            
+            while retry_count < max_retries and not self.discovery_listener_running:
+                try:
+                    self.discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self.discovery_socket.bind(('0.0.0.0', discovery_port))
+                    self.discovery_socket.listen(5)
+                    self.discovery_listener_running = True
+                    
+                    logger.info(f"Discovery listener started on port {discovery_port}")
+                    
+                    while self.discovery_listener_running:
+                        try:
+                            self.discovery_socket.settimeout(1.0)
+                            client, addr = self.discovery_socket.accept()
+                            
+                            # Handle discovery request in a separate thread
+                            threading.Thread(
+                                target=self.handle_discovery_request,
+                                args=(client, addr, current_user),
+                                daemon=True
+                            ).start()
+                            
+                        except socket.timeout:
+                            continue
+                        except Exception as e:
+                            if self.discovery_listener_running:
+                                logger.error(f"Discovery listener error: {e}")
+                                
+                except OSError as e:
+                    if e.errno == 98:  # Address already in use
+                        discovery_port += 1
+                        retry_count += 1
+                        logger.warning(f"Port in use, trying port {discovery_port}")
+                    else:
+                        logger.error(f"Failed to start discovery listener: {e}")
+                        break
+                except Exception as e:
+                    logger.error(f"Unexpected error in discovery listener: {e}")
+                    break
+                    
+            logger.info("Discovery listener stopped")
+            
+        threading.Thread(target=discovery_listener_thread, daemon=True).start()
+        time.sleep(0.5)  # Give the listener time to start
+        
+        # Store the discovery port for future use
+        self.discovery_port = discovery_port
+        
+    def handle_discovery_request(self, client, addr, current_user):
+        """Handle incoming discovery request"""
+        try:
+            client.settimeout(2.0)
+            data = client.recv(1024)
+            
+            if data:
+                try:
+                    msg = json.loads(data.decode())
+                    if msg.get('type') == 'discover':
+                        # Send our details back
+                        response = {
+                            'type': 'discovery_response',
+                            'username': current_user.username,
+                            'port': current_user.port,
+                            'ip': self.local_ip  # We send our local IP for information
+                        }
+                        client.send(json.dumps(response).encode())
+                        
+                        # Store the peer with their ACTUAL IP
+                        with self.discovery_lock:
+                            actual_peer_ip = addr[0]  # This is the real IP
+                            
+                            # Only use localhost if they're actually on localhost
+                            if actual_peer_ip == '127.0.0.1' and msg.get('ip') != '127.0.0.1':
+                                # They connected from localhost but claim a different IP
+                                # This might be a same-machine connection
+                                actual_peer_ip = msg.get('ip', addr[0])
+                            
+                            peer_info = {
+                                'username': msg.get('username'),
+                                'ip': actual_peer_ip,  # Use the actual source IP
+                                'port': msg.get('port'),
+                                'discovered_at': time.time(),
+                                'discovery_method': 'passive_response',
+                                'claimed_ip': msg.get('ip')  # Store for debugging
+                            }
+                            
+                            # Only add if not already there
+                            if not any(p.get('username') == peer_info['username'] 
+                                    for p in self.discovered_peers_cache):
+                                self.discovered_peers_cache.append(peer_info)
+                                
+                        logger.info(f"Responded to discovery from {msg.get('username')} "
+                                f"at actual IP: {actual_peer_ip} (claimed: {msg.get('ip')})")
+                        
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid discovery request from {addr}")
+                    
+        except Exception as e:
+            logger.error(f"Error handling discovery request: {e}")
+        finally:
+            try:
+                client.close()
+            except:
+                pass
+    
+    def discover_peers(self, current_user):
+        """Discover peers on the network with improved bidirectional discovery"""
+        discovered_peers = []
+        scan_results = {}
+        
+        # Clear the cache before starting new discovery
+        with self.discovery_lock:
+            self.discovered_peers_cache = []
+        
+        # Ensure discovery listener is running
+        self.start_discovery_listener(current_user)
+        
+        def scan_target(ip, port, discovery_port=None):
+            # Skip scanning ourselves
             if ip == self.local_ip and port == current_user.port:
-                return  # Skip our own IP:port
+                return
                 
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
+                sock.settimeout(2.0)
+                
+                scan_key = f"{ip}:{port}"
+                
+                # Try main port first
                 result = sock.connect_ex((ip, port))
                 if result == 0:
+                    # Send discovery message
                     message = {
-                        'type': 'discover', 
+                        'type': 'discover',
                         'username': current_user.username,
                         'port': current_user.port,
-                        'ip': self.local_ip
+                        'ip': self.local_ip,
+                        'discovery_port': getattr(self, 'discovery_port', current_user.port + 100)
                     }
                     sock.send(json.dumps(message).encode())
                     
-                    sock.settimeout(5)
-                    response = sock.recv(1024)
-                    if response:
-                        peer_info = json.loads(response.decode())
-                        if peer_info.get('username') != current_user.username:
-                            discovered_peers.append(peer_info)
+                    # Wait for response
+                    sock.settimeout(3)
+                    try:
+                        response = sock.recv(1024)
+                        if response:
+                            try:
+                                peer_info = json.loads(response.decode())
+                                if peer_info.get('username') != current_user.username:
+                                    peer_info['discovery_method'] = 'active_scan'
+                                    peer_info['discovered_at'] = time.time()
+                                    
+                                    # CRITICAL FIX: Always use the IP we connected to,
+                                    # not what the peer claims
+                                    # Only use localhost if we explicitly connected to localhost
+                                    if ip not in ['127.0.0.1', 'localhost', '::1']:
+                                        peer_info['ip'] = ip  # Use the actual IP we connected to
+                                    else:
+                                        # We connected to localhost, so keep it
+                                        peer_info['ip'] = ip
+                                    
+                                    logger.info(f"Discovered peer {peer_info.get('username')} "
+                                            f"at {ip}:{port} (peer reported IP: {peer_info.get('ip', 'unknown')})")
+                                    
+                                    with self.discovery_lock:
+                                        discovered_peers.append(peer_info)
+                                        
+                                    scan_results[scan_key] = f"Found peer: {peer_info.get('username')}"
+                                    
+                            except json.JSONDecodeError:
+                                scan_results[scan_key] = "Invalid response"
+                    except socket.timeout:
+                        scan_results[scan_key] = "Response timeout"
                         
                 sock.close()
+                
+                # Also try discovery port if different from main port
+                if discovery_port and discovery_port != port:
+                    try:
+                        sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock2.settimeout(1.0)
+                        if sock2.connect_ex((ip, discovery_port)) == 0:
+                            # Send discovery message
+                            sock2.send(json.dumps(message).encode())
+                            sock2.settimeout(2)
+                            response = sock2.recv(1024)
+                            if response:
+                                peer_info = json.loads(response.decode())
+                                if (peer_info.get('username') != current_user.username and
+                                    not any(p.get('username') == peer_info.get('username') 
+                                        for p in discovered_peers)):
+                                    peer_info['discovery_method'] = 'discovery_port_scan'
+                                    peer_info['discovered_at'] = time.time()
+                                    
+                                    # Use actual IP from connection
+                                    if ip not in ['127.0.0.1', 'localhost', '::1']:
+                                        peer_info['ip'] = ip
+                                    else:
+                                        peer_info['ip'] = ip
+                                        
+                                    with self.discovery_lock:
+                                        discovered_peers.append(peer_info)
+                                    logger.info(f"Found peer via discovery port: {peer_info.get('username')} at {ip}")
+                        sock2.close()
+                    except:
+                        pass
+                        
             except Exception as e:
+                scan_results[scan_key] = f"Error: {str(e)}"
                 logger.debug(f"Discovery error for {ip}:{port}: {e}")
         
-        # Scan local network with thread pool
+        # Get subnet info
+        ip_parts = self.local_ip.split('.')
+        subnet_base = '.'.join(ip_parts[0:3]) + '.'
+        
         threads = []
-        # Scan the same IP (our machine) on different ports
-        for port in self.all_ports:
-            t = threading.Thread(target=scan_port, args=(self.local_ip, port))
+        
+        # Prioritized scanning
+        scan_targets = []
+        
+        # 1. Known peers
+        for peer in self.get_known_peers():
+            scan_targets.append((peer['ip'], peer['port'], peer.get('discovery_port')))
+            
+        # 2. Common ports on our IP (for same-machine peers)
+        for port in self.all_ports[:5]:  # First 5 ports
+            if port != current_user.port:
+                scan_targets.append((self.local_ip, port, port + 100))
+                scan_targets.append(('127.0.0.1', port, port + 100))  # Also check localhost
+                
+        # 3. Local subnet scan
+        our_last_octet = int(ip_parts[3])
+        
+        # Scan nearby IPs first (±10 from our IP)
+        for offset in range(-10, 11):
+            last_octet = our_last_octet + offset
+            if 1 <= last_octet <= 254 and last_octet != our_last_octet:
+                target_ip = subnet_base + str(last_octet)
+                for port in self.all_ports[:3]:  # First 3 ports
+                    scan_targets.append((target_ip, port, port + 100))
+                    
+        # 4. Scan common device IPs (routers, servers often at .1, .2, etc)
+        for last_octet in [1, 2, 3, 100, 200]:
+            if last_octet != our_last_octet:
+                target_ip = subnet_base + str(last_octet)
+                scan_targets.append((target_ip, self.all_ports[0], self.all_ports[0] + 100))
+                
+        # 5. Broader subnet scan for remaining IPs
+        for last_octet in range(1, 255):
+            if last_octet == our_last_octet or abs(last_octet - our_last_octet) <= 10:
+                continue  # Skip our IP and nearby IPs (already scanned)
+            target_ip = subnet_base + str(last_octet)
+            # Just scan the primary port for these
+            scan_targets.append((target_ip, self.all_ports[0], None))
+                    
+        # Start scanning
+        for target in scan_targets:
+            t = threading.Thread(target=scan_target, args=target)
             threads.append(t)
             t.start()
             
-        # Wait for all threads to complete
+        # Wait for threads with timeout
+        max_wait = 30
+        start_time = time.time()
+        
         for t in threads:
-            t.join()
-            
+            remaining = max(0.1, max_wait - (time.time() - start_time))
+            t.join(timeout=remaining)
+            if time.time() - start_time > max_wait:
+                logger.info("Discovery scan timeout reached")
+                break
+                
+        # Also wait a bit for passive discoveries
+        time.sleep(2)
+        
+        # Combine active and passive discoveries
+        with self.discovery_lock:
+            for peer in self.discovered_peers_cache:
+                # Check if we already have this peer from active scanning
+                existing = next((p for p in discovered_peers if p.get('username') == peer.get('username')), None)
+                
+                if existing:
+                    # Prefer non-localhost IPs
+                    if existing.get('ip', '').startswith('127.') and not peer.get('ip', '').startswith('127.'):
+                        # Update with the better IP
+                        existing['ip'] = peer['ip']
+                        logger.info(f"Updated {peer.get('username')} IP from localhost to {peer['ip']}")
+                else:
+                    # Add new peer from passive discovery
+                    discovered_peers.append(peer)
+                    
+        # Update known peers
+        self.update_known_peers(discovered_peers)
+        
+        # Log discovery results
+        logger.info(f"Discovery completed: {len(discovered_peers)} peers found")
+        for peer in discovered_peers:
+            logger.info(f"  - {peer.get('username')} at {peer.get('ip')}:{peer.get('port')} "
+                    f"(method: {peer.get('discovery_method', 'unknown')})")
+        
+        # Debug: Log any peers with localhost IPs
+        localhost_peers = [p for p in discovered_peers if p.get('ip', '').startswith('127.')]
+        if localhost_peers:
+            logger.warning(f"Found {len(localhost_peers)} peers with localhost IPs:")
+            for peer in localhost_peers:
+                logger.warning(f"  - {peer.get('username')} at {peer.get('ip')}")
+        
         return discovered_peers
+    
+    def update_known_peers(self, discovered_peers):
+        """Update the list of known peers for future discovery"""
+        for peer in discovered_peers:
+            if 'username' in peer and 'ip' in peer and 'port' in peer:
+                key = peer['username']
+                self.known_peers[key] = {
+                    'ip': peer['ip'],
+                    'port': peer['port'],
+                    'discovery_port': peer.get('discovery_port', peer['port'] + 100),
+                    'last_seen': time.time()
+                }
+    
+    def get_known_peers(self):
+        """Get previously discovered peers for prioritized scanning"""
+        result = []
+        for username, data in self.known_peers.items():
+            result.append({
+                'username': username,
+                'ip': data['ip'],
+                'port': data['port'],
+                'discovery_port': data.get('discovery_port', data['port'] + 100),
+                'last_seen': data['last_seen']
+            })
+        
+        result.sort(key=lambda x: x['last_seen'], reverse=True)
+        return result[:10]  # Return only the 10 most recently seen peers
     
     def send_message(self, peer, message_data, timeout=5):
         """Send a message to a peer with proper timeout"""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)  # Set a strict timeout
+            # Never treat a peer as local unless they're explicitly on localhost
+            # or we're absolutely certain they're on the same machine
+            is_localhost_peer = peer.ip in ['127.0.0.1', 'localhost', '::1']
             
-            # Determine if peer is on the same machine
-            is_local_peer = peer.ip == self.local_ip or peer.ip.startswith('127.') or peer.ip == 'localhost'
+            # Use the peer's actual IP
+            connect_ip = peer.ip
             
-            # Use the appropriate IP for connection
-            connect_ip = '127.0.0.1' if is_local_peer else peer.ip
-            
-            # Log the connection attempt (only once with the correct IP)
             logger.info(f"Connecting to {peer.username} at {connect_ip}:{peer.port}")
             
-            # Try to connect using connect_ip, not peer.ip
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            
+            # Try to connect
             sock.connect((connect_ip, peer.port))
             
             # Send the message
             sock.send(json.dumps(message_data).encode())
             
-            # Wait for response with timeout
-            sock.settimeout(timeout)
-            response = sock.recv(1024)
+            # Wait for response
+            response = sock.recv(8192)
             sock.close()
             
             if response:
@@ -286,7 +620,7 @@ class NetworkManager:
             return None
             
         except socket.timeout:
-            logger.error(f"Connection to {peer.username} timed out")
+            logger.error(f"Connection to {peer.username} timed out at {connect_ip}:{peer.port}")
             raise TimeoutError(f"Connection to {peer.username} timed out")
             
         except ConnectionRefusedError:
@@ -294,14 +628,22 @@ class NetworkManager:
             raise ConnectionRefusedError(f"Peer {peer.username} refused connection")
             
         except Exception as e:
-            logger.error(f"Error sending message to {peer.username}: {e}")
+            logger.error(f"Error sending message to {peer.username}: {type(e).__name__}: {e}")
             raise
             
     def shutdown(self):
-        """Shutdown the server"""
+        """Shutdown the server and discovery listener"""
         self.is_server_running = False
+        self.discovery_listener_running = False
+        
         if self.server_socket:
             try:
                 self.server_socket.close()
+            except:
+                pass
+        
+        if hasattr(self, 'discovery_socket') and self.discovery_socket:
+            try:
+                self.discovery_socket.close()
             except:
                 pass
