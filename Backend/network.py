@@ -317,27 +317,32 @@ class NetworkManager:
                             'type': 'discovery_response',
                             'username': current_user.username,
                             'port': current_user.port,
-                            'ip': self.local_ip  # We send our local IP for information
+                            'ip': self.local_ip
                         }
                         client.send(json.dumps(response).encode())
                         
                         # Store the peer with their ACTUAL IP
                         with self.discovery_lock:
-                            actual_peer_ip = addr[0]  # This is the real IP
+                            # FIXED: Always use the actual connection IP for remote peers
+                            actual_peer_ip = addr[0]  # This is the real IP they connected from
                             
-                            # Only use localhost if they're actually on localhost
-                            if actual_peer_ip == '127.0.0.1' and msg.get('ip') != '127.0.0.1':
-                                # They connected from localhost but claim a different IP
-                                # This might be a same-machine connection
-                                actual_peer_ip = msg.get('ip', addr[0])
-                            
+                            # Only use localhost if they ACTUALLY connected from localhost
+                            # AND they're claiming to be on localhost
+                            if actual_peer_ip == '127.0.0.1' and msg.get('ip') == '127.0.0.1':
+                                # They're truly local
+                                peer_ip = '127.0.0.1'
+                            else:
+                                # They're remote - use their actual IP
+                                peer_ip = actual_peer_ip
+                                
                             peer_info = {
                                 'username': msg.get('username'),
-                                'ip': actual_peer_ip,  # Use the actual source IP
+                                'ip': peer_ip,  # Use the corrected IP
                                 'port': msg.get('port'),
                                 'discovered_at': time.time(),
                                 'discovery_method': 'passive_response',
-                                'claimed_ip': msg.get('ip')  # Store for debugging
+                                'claimed_ip': msg.get('ip'),  # Store for debugging
+                                'actual_connection_ip': addr[0]  # Store the real connection IP
                             }
                             
                             # Only add if not already there
@@ -345,9 +350,11 @@ class NetworkManager:
                                     for p in self.discovered_peers_cache):
                                 self.discovered_peers_cache.append(peer_info)
                                 
-                        logger.info(f"Responded to discovery from {msg.get('username')} "
-                                f"at actual IP: {actual_peer_ip} (claimed: {msg.get('ip')})")
-                        
+                            logger.info(f"Discovered {msg.get('username')} from {addr[0]}:{addr[1]}")
+                            logger.info(f"  - Actual IP: {peer_ip}")
+                            logger.info(f"  - Claimed IP: {msg.get('ip')}")
+                            logger.info(f"  - Using IP: {peer_ip}")
+                            
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid discovery request from {addr}")
                     
@@ -358,6 +365,184 @@ class NetworkManager:
                 client.close()
             except:
                 pass
+
+    def fix_localhost_ips(self, discovered_peers, current_user):
+        """Fix any peers that have localhost IPs but are actually remote"""
+        fixed_peers = []
+        
+        for peer in discovered_peers:
+            peer_copy = peer.copy()
+            
+            # Check if this peer has a localhost IP
+            if peer_copy.get('ip', '').startswith('127.'):
+                username = peer_copy.get('username')
+                port = peer_copy.get('port')
+                
+                logger.info(f"Peer {username} has localhost IP, attempting to find real IP...")
+                
+                # Try to find their real IP by scanning the network
+                real_ip = self.find_peer_real_ip_by_username(username, port)
+                
+                if real_ip and real_ip != '127.0.0.1':
+                    logger.info(f"Found {username}'s real IP: {real_ip}")
+                    peer_copy['ip'] = real_ip
+                    peer_copy['localhost_fixed'] = True
+                else:
+                    # If we can't find them on the network, check if they're truly local
+                    if self.is_peer_on_same_machine(username, port):
+                        logger.info(f"Peer {username} is on the same machine (localhost is correct)")
+                    else:
+                        logger.warning(f"Could not find real IP for {username}, keeping localhost")
+            
+            fixed_peers.append(peer_copy)
+        
+        return fixed_peers
+
+    def find_peer_real_ip_by_username(self, username, port):
+        """Scan the network to find a peer's real IP by their username"""
+        ip_parts = self.local_ip.split('.')
+        subnet_base = '.'.join(ip_parts[0:3]) + '.'
+        
+        logger.info(f"Scanning subnet {subnet_base}0/24 for {username} on port {port}")
+        
+        # Parallel scanning with threading
+        found_ip = [None]  # Use list to make it mutable in threads
+        scan_lock = threading.Lock()
+        
+        def scan_ip(ip):
+            if found_ip[0]:  # Already found, skip
+                return
+                
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                
+                if sock.connect_ex((ip, port)) == 0:
+                    # Port is open, verify it's the right peer
+                    message = {
+                        'type': 'discover',
+                        'username': 'scanner',
+                        'port': 0,
+                        'ip': self.local_ip
+                    }
+                    sock.send(json.dumps(message).encode())
+                    
+                    sock.settimeout(2)
+                    response = sock.recv(1024)
+                    if response:
+                        try:
+                            peer_info = json.loads(response.decode())
+                            if peer_info.get('username') == username:
+                                with scan_lock:
+                                    if not found_ip[0]:  # First to find it
+                                        found_ip[0] = ip
+                                        logger.info(f"Found {username} at {ip}:{port}")
+                        except:
+                            pass
+                sock.close()
+            except:
+                pass
+        
+        # Scan all IPs in subnet except our own
+        threads = []
+        for last_octet in range(1, 255):
+            ip = subnet_base + str(last_octet)
+            if ip != self.local_ip:  # Skip our own IP
+                thread = threading.Thread(target=scan_ip, args=(ip,))
+                threads.append(thread)
+                thread.start()
+        
+        # Wait for threads with timeout
+        for thread in threads:
+            thread.join(timeout=0.1)
+            if found_ip[0]:  # Stop waiting if we found it
+                break
+        
+        return found_ip[0]
+
+    def is_peer_on_same_machine(self, username, port):
+        """Check if a peer is actually on the same machine"""
+        try:
+            # Try connecting to localhost
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            
+            if sock.connect_ex(('127.0.0.1', port)) == 0:
+                # Send discovery message
+                message = {
+                    'type': 'discover',
+                    'username': 'local_check',
+                    'port': 0,
+                    'ip': '127.0.0.1'
+                }
+                sock.send(json.dumps(message).encode())
+                
+                sock.settimeout(2)
+                response = sock.recv(1024)
+                if response:
+                    try:
+                        peer_info = json.loads(response.decode())
+                        if peer_info.get('username') == username:
+                            sock.close()
+                            return True
+                    except:
+                        pass
+            sock.close()
+        except:
+            pass
+        
+        return False
+
+    def update_known_peers(self, discovered_peers):
+        """Update the list of known peers for future discovery"""
+        for peer in discovered_peers:
+            if 'username' in peer and 'ip' in peer and 'port' in peer:
+                key = peer['username']
+                
+                # Don't overwrite a good IP with localhost
+                if key in self.known_peers:
+                    existing_ip = self.known_peers[key]['ip']
+                    new_ip = peer['ip']
+                    
+                    # Keep the non-localhost IP if we have one
+                    if existing_ip.startswith('127.') and not new_ip.startswith('127.'):
+                        # New IP is better, use it
+                        logger.info(f"Updating {key} from localhost to {new_ip}")
+                    elif not existing_ip.startswith('127.') and new_ip.startswith('127.'):
+                        # Existing IP is better, keep it
+                        logger.info(f"Keeping {key}'s existing IP {existing_ip} instead of localhost")
+                        continue
+                
+                self.known_peers[key] = {
+                    'ip': peer['ip'],
+                    'port': peer['port'],
+                    'discovery_port': peer.get('discovery_port', peer['port'] + 100),
+                    'last_seen': time.time()
+                }
+
+    def fix_peer_ip_manually(self, username, correct_ip):
+        """Manually fix a peer's IP address"""
+        # Fix in known_peers
+        if username in self.known_peers:
+            old_ip = self.known_peers[username]['ip']
+            self.known_peers[username]['ip'] = correct_ip
+            logger.info(f"Fixed {username}'s IP from {old_ip} to {correct_ip}")
+        
+        # Fix in discovered_peers_cache
+        with self.discovery_lock:
+            for peer in self.discovered_peers_cache:
+                if peer.get('username') == username:
+                    old_ip = peer.get('ip')
+                    peer['ip'] = correct_ip
+                    logger.info(f"Fixed {username}'s cached IP from {old_ip} to {correct_ip}")
+        
+        # Fix in the app_controller's users list
+        if hasattr(self.app_controller, 'users') and username in self.app_controller.users:
+            user = self.app_controller.users[username]
+            if hasattr(user, 'ip'):
+                old_ip = user.ip
+                user.ip = correct_ip
+                logger.info(f"Fixed {username}'s user object IP from {old_ip} to {correct_ip}")
     
     def discover_peers(self, current_user):
         """Discover peers on the network with improved bidirectional discovery"""
@@ -544,7 +729,10 @@ class NetworkManager:
                 else:
                     # Add new peer from passive discovery
                     discovered_peers.append(peer)
-                    
+        
+        # FIX LOCALHOST IPs BEFORE UPDATING KNOWN PEERS
+        discovered_peers = self.fix_localhost_ips(discovered_peers, current_user)
+        
         # Update known peers
         self.update_known_peers(discovered_peers)
         
@@ -563,17 +751,17 @@ class NetworkManager:
         
         return discovered_peers
     
-    def update_known_peers(self, discovered_peers):
-        """Update the list of known peers for future discovery"""
-        for peer in discovered_peers:
-            if 'username' in peer and 'ip' in peer and 'port' in peer:
-                key = peer['username']
-                self.known_peers[key] = {
-                    'ip': peer['ip'],
-                    'port': peer['port'],
-                    'discovery_port': peer.get('discovery_port', peer['port'] + 100),
-                    'last_seen': time.time()
-                }
+    # def update_known_peers(self, discovered_peers):
+    #     """Update the list of known peers for future discovery"""
+    #     for peer in discovered_peers:
+    #         if 'username' in peer and 'ip' in peer and 'port' in peer:
+    #             key = peer['username']
+    #             self.known_peers[key] = {
+    #                 'ip': peer['ip'],
+    #                 'port': peer['port'],
+    #                 'discovery_port': peer.get('discovery_port', peer['port'] + 100),
+    #                 'last_seen': time.time()
+    #             }
     
     def get_known_peers(self):
         """Get previously discovered peers for prioritized scanning"""
@@ -593,13 +781,31 @@ class NetworkManager:
     def send_message(self, peer, message_data, timeout=5):
         """Send a message to a peer with proper timeout"""
         try:
-            # Never treat a peer as local unless they're explicitly on localhost
-            # or we're absolutely certain they're on the same machine
-            is_localhost_peer = peer.ip in ['127.0.0.1', 'localhost', '::1']
+            # Debug what peer object we're getting
+            logger.debug(f"send_message called for peer: {vars(peer)}")
             
-            # Use the peer's actual IP
+            # Check if peer has localhost IP but isn't actually local
+            if peer.ip.startswith('127.') and peer.username != self.app_controller.current_user.username:
+                logger.warning(f"Peer {peer.username} has localhost IP, attempting to find real IP...")
+                
+                # Try to find real IP
+                real_ip = self.find_peer_real_ip_by_username(peer.username, peer.port)
+                if real_ip and not real_ip.startswith('127.'):
+                    logger.info(f"Found {peer.username}'s real IP: {real_ip}")
+                    # Fix it everywhere
+                    self.fix_peer_ip_manually(peer.username, real_ip)
+                    # Update the peer object we're using
+                    peer.ip = real_ip
+                else:
+                    logger.error(f"Could not find real IP for {peer.username}")
+                    # Try known_peers as last resort
+                    if peer.username in self.known_peers:
+                        known_ip = self.known_peers[peer.username].get('ip')
+                        if known_ip and not known_ip.startswith('127.'):
+                            logger.info(f"Using known IP for {peer.username}: {known_ip}")
+                            peer.ip = known_ip
+            
             connect_ip = peer.ip
-            
             logger.info(f"Connecting to {peer.username} at {connect_ip}:{peer.port}")
             
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -625,12 +831,36 @@ class NetworkManager:
             
         except ConnectionRefusedError:
             logger.error(f"Connection to {peer.username} refused at {connect_ip}:{peer.port}")
+            # Call debug method to see what's stored
+            self.debug_peer_info(peer.username)
             raise ConnectionRefusedError(f"Peer {peer.username} refused connection")
             
         except Exception as e:
             logger.error(f"Error sending message to {peer.username}: {type(e).__name__}: {e}")
             raise
             
+    def debug_peer_info(self, username):
+        """Debug method to see all stored info about a peer"""
+        logger.info(f"\n=== DEBUG INFO FOR {username} ===")
+        
+        # Check known_peers
+        if username in self.known_peers:
+            logger.info(f"Known peers entry: {self.known_peers[username]}")
+        else:
+            logger.info(f"Not found in known_peers")
+        
+        # Check discovered_peers_cache
+        with self.discovery_lock:
+            for peer in self.discovered_peers_cache:
+                if peer.get('username') == username:
+                    logger.info(f"Discovery cache entry: {peer}")
+        
+        # Check app_controller users
+        if hasattr(self.app_controller, 'users') and username in self.app_controller.users:
+            user = self.app_controller.users[username]
+            logger.info(f"App controller user: {vars(user)}")
+        
+        logger.info("=== END DEBUG INFO ===\n")
     def shutdown(self):
         """Shutdown the server and discovery listener"""
         self.is_server_running = False
